@@ -1,0 +1,6 @@
+streamlit>=1.38
+plotly>=5.22
+matplotlib>=3.8
+fpdf2>=2.7
+pandas>=2.2
+requests>=2.32
