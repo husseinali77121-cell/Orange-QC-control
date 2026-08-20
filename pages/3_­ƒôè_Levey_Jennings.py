@@ -4,6 +4,25 @@ pages/3_📊_Levey_Jennings.py
 Interactive Levey-Jennings chart per test + control level, with rule
 violations annotated directly on the plot so shifts/trends/random errors
 are visible at a glance.
+
+Fixed after review (this was the most important logic bug found):
+  This page used to re-run the Westgard engine ONE LEVEL AT A TIME to
+  build the chart, which could produce a DIFFERENT verdict than what QC
+  Entry showed and saved — e.g. Entry correctly reports "REJECT — 2-2s
+  within-run" for a two-level run, but re-evaluating Level 1 alone here
+  only saw "WARNING — 1-2s". A QC program must never show two different
+  verdicts for the same run.
+
+  The fix: this page no longer calls evaluate_run() at all. It reads
+  `overall_status` and `violated_rules` straight from the saved record —
+  whatever was decided (and persisted) at entry time is the single source
+  of truth, everywhere it's displayed.
+
+  Also added: a "standardized Z-score" chart mode (fixed bands at
+  ±1/2/3 SD regardless of lot), recommended — and used by default —
+  whenever the selected range spans more than one control lot, instead of
+  plotting raw results from two different lots against one (wrong) set of
+  reference bands.
 """
 
 import datetime as dt
@@ -11,9 +30,9 @@ import datetime as dt
 import streamlit as st
 
 from core import auth, data_manager
-from core.models import TestDefinition, QCPoint
-from core.westgard_engine import evaluate_run
-from core.charts import build_lj_plotly
+from core.models import TestDefinition
+from core.westgard_engine import rule_display_name
+from core.charts import build_lj_plotly, build_lj_plotly_zscore
 
 st.set_page_config(page_title="Levey-Jennings — Orange Lab QC", page_icon="📊", layout="wide")
 
@@ -35,59 +54,53 @@ level_id = c2.selectbox("Control level", list(td.levels.keys()),
                          format_func=lambda k: td.levels[k].control_name)
 n_months_back = c3.slider("Months of history", 1, 12, 3)
 
-branch_filter = st.selectbox("Branch", ["All"] + auth.get_branches())
-extended_rules = st.checkbox("Extended rules were/are used (8x/9x/12x/7T)", value=False)
+branch_filter = st.selectbox("Branch", auth.get_branches())
 
-
-def last_n_months(n, from_date):
-    out = []
-    y, m = from_date.year, from_date.month
-    for _ in range(n):
-        out.append(f"{y:04d}-{m:02d}")
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-    return out
-
-
-months = last_n_months(n_months_back, dt.date.today())
+months = data_manager.last_n_months(n_months_back, dt.date.today().isoformat())
 raw = data_manager.load_qc_records_range(months)
-raw = [r for r in raw if r["test_id"] == test_id and r["level_id"] == level_id]
-if branch_filter != "All":
-    raw = [r for r in raw if r["branch"] == branch_filter]
+raw = [r for r in raw if r["test_id"] == test_id and r["level_id"] == level_id and r["branch"] == branch_filter]
 raw.sort(key=lambda r: (r["date"], r["run_number"]))
 
 if not raw:
-    st.info("No QC results yet for this test/level in the selected window.")
+    st.info("No QC results yet for this test/level/branch in the selected window.")
     st.stop()
 
 lvl = td.levels[level_id]
 latest_version = lvl.active_version()
-mean, sd = latest_version.mean, latest_version.sd
-if len({(r["mean_used"], r["sd_used"]) for r in raw}) > 1:
+spans_multiple_lots = len({(r["mean_used"], r["sd_used"]) for r in raw}) > 1
+
+chart_mode = st.radio(
+    "Chart mode",
+    ["Standardized Z-score (recommended)", "Raw result units"],
+    index=0,
+    horizontal=True,
+    help="Standardized Z-score always uses fixed ±1/2/3 SD bands and is safe to use across a "
+         "lot change. Raw result units are easier to read at a glance but only make sense "
+         "within a single lot's mean/SD.",
+)
+if spans_multiple_lots and chart_mode == "Raw result units":
     st.warning(
-        "⚠️ This range spans more than one control lot (different mean/SD were used at different "
-        "times). The chart below plots raw results against the CURRENT mean/SD bands for visual "
-        "reference — individual Z-scores in the table still use the lot that was active on each date."
+        "⚠️ This range spans more than one control lot (different Mean/SD were active at "
+        "different times). Raw-unit bands below use the CURRENT lot's Mean/SD for reference — "
+        "older points from a previous lot may look artificially off-target. Switch to "
+        "**Standardized Z-score** for an always-correct view across the lot change."
     )
 
-# Re-run the engine chronologically so the chart shows exactly the same
-# verdict the operator saw at entry time (uses each point's own recorded mean/sd).
+# Build chart points straight from the SAVED verdict — no re-evaluation.
 points = []
-history = []
 for r in raw:
-    p = QCPoint(level_id=r["level_id"], date=r["date"], run_number=r["run_number"],
-                result=r["result"], mean=r["mean_used"], sd=r["sd_used"], record_id=r["id"])
-    ev = evaluate_run([p], history, extended_rules=extended_rules)
+    z = (r["result"] - r["mean_used"]) / r["sd_used"] if r["sd_used"] else 0.0
     points.append({
         "date": r["date"], "run_number": r["run_number"], "result": r["result"],
-        "z": p.z, "status": ev.overall_status,
-        "rule_names": [v.rule_name for v in ev.violations],
+        "z": z, "status": r["overall_status"],
+        "rule_names": [rule_display_name(rid) for rid in r.get("violated_rules", [])],
     })
-    history.append(p)
 
-fig = build_lj_plotly(points, mean, sd, title=f"{td.test_name} — {lvl.control_name}")
+if chart_mode.startswith("Standardized"):
+    fig = build_lj_plotly_zscore(points, title=f"{td.test_name} — {lvl.control_name}")
+else:
+    fig = build_lj_plotly(points, latest_version.mean, latest_version.sd,
+                           title=f"{td.test_name} — {lvl.control_name}")
 st.plotly_chart(fig, use_container_width=True)
 
 n_reject = sum(1 for p in points if p["status"] == "reject")

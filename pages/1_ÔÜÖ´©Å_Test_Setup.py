@@ -7,6 +7,18 @@ Each control level keeps a HISTORY of mean/SD versions (one per lot). When
 you set up a new lot, you add a new version with its own effective_from
 date — old QC records keep scoring against the mean/SD that was actually
 active when they were entered.
+
+Fixed after review:
+  - This page now sits behind an extra admin-password gate (see
+    core/auth.require_admin) — every QC verdict downstream depends on the
+    Mean/SD/lot values set here, so changing them deserves a higher bar
+    than day-to-day QC entry.
+  - Registering a new lot now rejects a duplicate effective_from date for
+    the same level, and rejects an expiry date before the effective date
+    — both were previously unvalidated.
+  - The edit view now explicitly flags a level with NO active lot for
+    today's date (e.g. every version is dated in the future) instead of
+    silently showing nothing.
 """
 
 import datetime as dt
@@ -21,6 +33,9 @@ st.set_page_config(page_title="Test Setup — Orange Lab QC", page_icon="⚙️"
 if not auth.require_login():
     st.stop()
 auth.logout_button()
+
+if not auth.require_admin():
+    st.stop()
 
 st.title("⚙️ Test Setup")
 st.caption("Define analytes and control levels for the BIOBASE BK-280.")
@@ -59,10 +74,17 @@ with tab_new:
         submitted = st.form_submit_button("Save test")
 
     if submitted:
+        bad_expiry = [
+            li["name"] for li in level_inputs
+            if li["expiry"] and li["expiry"] < effective_from
+        ]
         if not test_name.strip():
             st.error("Test name is required.")
         elif any(li["sd"] <= 0 for li in level_inputs):
             st.error("SD must be greater than 0 for every level (needed for Z-score calculation).")
+        elif bad_expiry:
+            st.error(f"Expiry date is before the effective date for: {', '.join(bad_expiry)}. "
+                     "Fix the dates and try again.")
         else:
             test_id = test_name.strip().lower().replace(" ", "_")
             levels = {}
@@ -105,6 +127,13 @@ with tab_edit:
                         f"Effective from: {active.effective_from}"
                         + (f" · Expires: {active.expiry_date}" if active.expiry_date else "")
                     )
+                elif lvl.versions:
+                    next_start = sorted(v.effective_from for v in lvl.versions)[0]
+                    st.error(f"⚠️ No lot is active for today — the earliest configured lot "
+                             f"doesn't start until {next_start}. QC Entry will skip this level "
+                             f"until then.")
+                else:
+                    st.warning("No lot configured yet for this level.")
                 if len(lvl.versions) > 1:
                     st.caption(f"{len(lvl.versions)} lot versions on record (history preserved for scoring old QC).")
             active_toggle = st.checkbox("Active", value=td.active, key=f"active_{test_id}")
@@ -143,6 +172,14 @@ with tab_lot:
         if submitted_lot:
             if sd <= 0:
                 st.error("SD must be greater than 0.")
+            elif expiry and expiry < eff:
+                st.error("Expiry date can't be before the effective date.")
+            elif td.levels[level_id].has_duplicate_effective_date(eff.isoformat()):
+                st.error(
+                    f"A lot version for {td.levels[level_id].control_name} is already effective "
+                    f"from {eff.isoformat()}. Pick a different effective date, or edit that entry "
+                    "directly in the data file if this was a mistake."
+                )
             else:
                 version = LevelVersion(
                     effective_from=eff.isoformat(), lot_number=lot or "N/A",
