@@ -10,7 +10,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import QCPoint
-from core.westgard_engine import evaluate_run
+from core.westgard_engine import evaluate_run, RULE_INFO, rule_display_name
 
 
 def pt(level, d, run, result, mean, sd):
@@ -118,6 +118,23 @@ def test_independent_levels_dont_cross_contaminate():
     new = [pt("level_1", "2026-08-19", 1, 101, 100, 3)]
     ev = evaluate_run(new, history=[])
     assert not any(v.scope == "within_run" for v in ev.violations)
+
+
+def test_all_rule_names_are_pdf_and_csv_safe():
+    # Regression guard: fpdf2's core fonts (and some CSV viewers) can't
+    # render subscript/combining Unicode. Every rule must expose a plain
+    # ASCII fallback so PDF generation can never crash on a rule label.
+    for rule_id, info in RULE_INFO.items():
+        assert "name_ascii" in info, f"{rule_id} missing name_ascii"
+        info["name_ascii"].encode("ascii")  # raises if not pure ASCII
+
+
+def test_rule_display_name_lookup_matches_engine_output():
+    new = [pt("level_1", "2026-08-19", 1, 110, 100, 3)]  # 1_3s
+    ev = evaluate_run(new, history=[])
+    violated_id = ev.violations[0].rule_id
+    assert rule_display_name(violated_id) == ev.violations[0].rule_name
+    assert rule_display_name(violated_id, ascii_safe=True) == ev.violations[0].rule_name_ascii
 
 
 if __name__ == "__main__":
