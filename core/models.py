@@ -62,15 +62,26 @@ class ControlLevel:
     versions: List[LevelVersion] = field(default_factory=list)
 
     def active_version(self, on_date: Optional[str] = None) -> Optional[LevelVersion]:
-        """Return the version that was in effect on `on_date` (default: today)."""
+        """Return the version that was in effect on `on_date` (default: today).
+
+        Returns None if no version had started yet by that date — e.g. the
+        first lot is only effective from 2026-09-01 and `on_date` is
+        2026-08-19. Callers MUST treat None as "no valid configuration for
+        this date" (a configuration error to surface to the user), not
+        silently fall back to a future lot's mean/SD — using a lot that
+        didn't exist yet would score the QC result against the wrong
+        reference and could hide a real error.
+        """
         if not self.versions:
             return None
         target = on_date or date.today().isoformat()
         candidates = [v for v in self.versions if v.effective_from <= target]
         if not candidates:
-            # everything is in the future relative to target -> fall back to earliest
-            return sorted(self.versions, key=lambda v: v.effective_from)[0]
+            return None
         return sorted(candidates, key=lambda v: v.effective_from)[-1]
+
+    def has_duplicate_effective_date(self, effective_from: str) -> bool:
+        return any(v.effective_from == effective_from for v in self.versions)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -156,7 +167,26 @@ class QCPoint:
 
 @dataclass
 class QCRecord:
-    """Persisted QC entry, one per (test, level, run)."""
+    """Persisted QC entry, one per (test, level, run).
+
+    `run_key` is the natural key used to detect duplicate submissions and
+    to group records back into "runs" (a run may cover 1-3 levels):
+    branch + test_id + date + run_number + level_id.
+
+    `extended_rules_enabled` and `engine_version` are captured at entry
+    time so a QC record stays auditable even if the rule set or the
+    extended-rules setting changes later — you can always tell which
+    ruleset actually produced a given historical verdict.
+
+    `capa` holds the structured investigation/CAPA record for rejected
+    runs (see core/data_manager.py). `capa_note` is kept only for backward
+    compatibility with records written before the structured CAPA form
+    existed; new code should read/write `capa`.
+
+    `audit_events` is an append-only log of edits made to this record
+    after it was first saved (e.g. CAPA updates) — old values are never
+    silently overwritten without a trace.
+    """
     id: str
     test_id: str
     test_name: str
@@ -173,8 +203,16 @@ class QCRecord:
     operator: str
     overall_status: str            # "in_control" | "warning" | "reject"
     violated_rules: List[str] = field(default_factory=list)   # rule_ids
-    capa_note: str = ""
+    extended_rules_enabled: bool = False
+    engine_version: str = ""
+    capa_note: str = ""             # deprecated — see `capa`
+    capa: Optional[Dict[str, Any]] = None
+    audit_events: List[Dict[str, Any]] = field(default_factory=list)
     timestamp: str = ""
+
+    @property
+    def run_key(self) -> str:
+        return f"{self.branch}|{self.test_id}|{self.date}|{self.run_number}|{self.level_id}"
 
     @property
     def z_score(self) -> float:

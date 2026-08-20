@@ -23,14 +23,27 @@ from itertools import combinations
 
 from core.models import QCPoint
 
+# Bump this whenever RULE_INFO logic changes in a way that could change a
+# verdict. Stored on every QCRecord so historical results stay auditable
+# even if the rule set is revised later (see review point P1 "rule
+# configuration not stored with the record").
+ENGINE_VERSION = "1.1.0"
+
 
 # ---------------------------------------------------------------------------
 # Rule catalogue (data-driven, easy to extend / edit with Dr. Tarek's sign-off)
+#
+# `name` is the pretty Unicode label used in the Streamlit UI and on the
+# Matplotlib chart (both render Unicode fine). `name_ascii` is the
+# PDF-safe / CSV-safe plain-text label — fpdf2's core fonts (and some CSV
+# viewers) choke on subscript digits and combining marks, so we keep an
+# explicit ASCII fallback instead of trying to transliterate on the fly.
 # ---------------------------------------------------------------------------
 
 RULE_INFO: Dict[str, Dict[str, str]] = {
     "1_2s": {
         "name": "1\u2082s",
+        "name_ascii": "1-2s",
         "status": "warning",
         "error_type": "Screening / trigger rule",
         "interpretation": "One control result exceeded the mean \u00b12SD. "
@@ -41,6 +54,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "1_3s": {
         "name": "1\u2083s",
+        "name_ascii": "1-3s",
         "status": "reject",
         "error_type": "Random error",
         "interpretation": "One control result exceeded the mean \u00b13SD.",
@@ -50,6 +64,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "2_2s_within_run": {
         "name": "2\u2082s (within-run)",
+        "name_ascii": "2-2s (within-run)",
         "status": "reject",
         "error_type": "Systematic error",
         "interpretation": "Two different control levels in the SAME run both exceeded "
@@ -59,6 +74,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "2_2s_across_run": {
         "name": "2\u2082s (across-run)",
+        "name_ascii": "2-2s (across-run)",
         "status": "reject",
         "error_type": "Systematic error",
         "interpretation": "This control level exceeded \u00b12SD on the SAME side in two "
@@ -68,6 +84,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "r_4s": {
         "name": "R\u2084s",
+        "name_ascii": "R-4s",
         "status": "reject",
         "error_type": "Random error",
         "interpretation": "The range between control levels WITHIN this run exceeded 4SD "
@@ -77,6 +94,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "4_1s": {
         "name": "4\u2081s",
+        "name_ascii": "4-1s",
         "status": "reject",
         "error_type": "Systematic error",
         "interpretation": "Four consecutive results for this level exceeded \u00b11SD on the "
@@ -86,6 +104,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "10x": {
         "name": "10x\u0304",
+        "name_ascii": "10x",
         "status": "reject",
         "error_type": "Systematic error",
         "interpretation": "Ten consecutive results for this level fell on the same side of "
@@ -95,6 +114,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "8x": {
         "name": "8x\u0304",
+        "name_ascii": "8x",
         "status": "reject",
         "error_type": "Systematic error (extended rule)",
         "interpretation": "Eight consecutive results for this level fell on the same side "
@@ -104,6 +124,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "9x": {
         "name": "9x\u0304",
+        "name_ascii": "9x",
         "status": "reject",
         "error_type": "Systematic error (extended rule)",
         "interpretation": "Nine consecutive results for this level fell on the same side "
@@ -112,6 +133,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "12x": {
         "name": "12x\u0304",
+        "name_ascii": "12x",
         "status": "reject",
         "error_type": "Systematic error (extended rule)",
         "interpretation": "Twelve consecutive results for this level fell on the same side "
@@ -120,6 +142,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
     },
     "7T": {
         "name": "7T",
+        "name_ascii": "7T",
         "status": "reject",
         "error_type": "Trend",
         "interpretation": "Seven consecutive results for this level are steadily trending "
@@ -134,6 +157,7 @@ RULE_INFO: Dict[str, Dict[str, str]] = {
 class RuleViolation:
     rule_id: str
     rule_name: str
+    rule_name_ascii: str
     status: str                      # "warning" | "reject"
     scope: str                       # "within_run" | "across_run"
     levels_involved: List[str]
@@ -186,11 +210,23 @@ def _is_trend(series_z: List[float], n: int = 7) -> Optional[str]:
     return None
 
 
+def rule_display_name(rule_id: str, ascii_safe: bool = False) -> str:
+    """Look up a display name for a stored rule_id without re-running the
+    engine — used by History/Levey-Jennings/Reports pages, which must show
+    the SAME verdict that was computed (and persisted) at entry time
+    rather than recomputing it (see architecture note in README)."""
+    info = RULE_INFO.get(rule_id)
+    if not info:
+        return rule_id
+    return info["name_ascii"] if ascii_safe else info["name"]
+
+
 def _make_violation(rule_id: str, scope: str, levels: List[str]) -> RuleViolation:
     info = RULE_INFO[rule_id]
     return RuleViolation(
         rule_id=rule_id,
         rule_name=info["name"],
+        rule_name_ascii=info["name_ascii"],
         status=info["status"],
         scope=scope,
         levels_involved=levels,

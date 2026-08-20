@@ -25,6 +25,7 @@ Only JSON, base64-encoded for GitHub Contents API as required by GitHub.
 """
 
 import base64
+import datetime as dt
 import json
 import os
 import time
@@ -33,8 +34,15 @@ from typing import Any, Dict, List, Optional
 import requests
 import streamlit as st
 
+from core.date_utils import last_n_months, months_between  # noqa: F401  (re-exported for pages)
+
 GITHUB_API = "https://api.github.com"
 LOCAL_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+
+# NOTE: last_n_months / months_between now live in core/date_utils.py
+# (pure functions, unit tested there) and are imported above so existing
+# call sites like `data_manager.last_n_months(...)` still work unchanged.
 
 
 def _github_configured() -> bool:
@@ -218,14 +226,34 @@ def append_qc_records(yyyymm: str, new_records: List[Dict[str, Any]], commit_mes
         _local_write(path, current)
 
 
-def update_qc_record(yyyymm: str, record_id: str, patch: Dict[str, Any], commit_message: str) -> None:
-    """Used for CAPA notes / investigation follow-up on an existing record."""
+def update_qc_record(
+    yyyymm: str, record_id: str, patch: Dict[str, Any], commit_message: str, actor: str = "Unknown"
+) -> None:
+    """Used for CAPA notes / investigation follow-up on an existing record.
+
+    Never silently overwrites: for every field in `patch` whose value
+    actually changes, an entry is appended to the record's `audit_events`
+    list (timestamp, actor, field, old_value, new_value) before the patch
+    is applied. This gives a real audit trail instead of losing the
+    previous value the moment someone edits a CAPA note.
+    """
     path = _month_path(yyyymm)
 
     def mutate(content):
         content = content or {"records": []}
         for r in content.get("records", []):
             if r["id"] == record_id:
+                audit = r.setdefault("audit_events", [])
+                for key, new_val in patch.items():
+                    old_val = r.get(key)
+                    if old_val != new_val:
+                        audit.append({
+                            "timestamp": dt.datetime.now().isoformat(),
+                            "actor": actor,
+                            "field": key,
+                            "old_value": old_val,
+                            "new_value": new_val,
+                        })
                 r.update(patch)
         return content
 
@@ -235,6 +263,66 @@ def update_qc_record(yyyymm: str, record_id: str, patch: Dict[str, Any], commit_
         current = _local_read_or_default(path, {"records": []})
         current = mutate(current)
         _local_write(path, current)
+
+
+def find_existing_record(
+    test_id: str, level_id: str, branch: str, date: str, run_number: int
+) -> Optional[Dict[str, Any]]:
+    """Exact-match lookup used to block duplicate QC submissions (same
+    branch + test + level + date + run entered twice, e.g. a double-click
+    on Save). Only checks the relevant month partition."""
+    for r in load_qc_records(date[:7]):
+        if (r["test_id"] == test_id and r["level_id"] == level_id and r["branch"] == branch
+                and r["date"] == date and r["run_number"] == run_number):
+            return r
+    return None
+
+
+def load_qc_history_for_level(
+    test_id: str,
+    level_id: str,
+    branch: str,
+    before_date: Optional[str] = None,
+    min_points: int = 15,
+    max_months_back: int = 36,
+    max_empty_streak: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Load enough QC history for one exact (test, level, branch) to safely
+    evaluate every Westgard rule the engine supports — including 12x / 7T,
+    which need up to 12 prior points. A fixed "last 3 calendar months"
+    window silently under-counts for low-frequency analytes (e.g. a test
+    run only a few times a month could take most of a year to reach 10
+    points). Instead this walks backward month by month, filtering
+    strictly by branch + level, accumulating matches until either:
+      - `min_points` matching records have been collected, or
+      - `max_months_back` months have been scanned, or
+      - `max_empty_streak` consecutive months had zero matches (assume QC
+        simply wasn't running that far back, to avoid scanning years of
+        empty files for a brand-new test).
+    Returns records sorted chronologically (oldest first) — ready to feed
+    straight into the Westgard engine as `history`.
+    """
+    ref = before_date or dt.date.today().isoformat()
+    collected: List[Dict[str, Any]] = []
+    empty_streak = 0
+
+    for yyyymm in last_n_months(max_months_back, ref):
+        matched = [
+            r for r in load_qc_records(yyyymm)
+            if r["test_id"] == test_id and r["level_id"] == level_id and r["branch"] == branch
+        ]
+        if matched:
+            collected.extend(matched)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+
+        if len(collected) >= min_points or empty_streak >= max_empty_streak:
+            break
+
+    collected.sort(key=lambda r: (r["date"], r["run_number"]))
+    return collected
 
 
 def storage_mode() -> str:

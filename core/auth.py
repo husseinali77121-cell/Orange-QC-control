@@ -68,6 +68,43 @@ def require_login() -> bool:
     return False
 
 
+def require_admin() -> bool:
+    """Extra gate for configuration-changing pages (Test Setup: adding
+    tests, changing mean/SD, registering new lots). Separate from the
+    general QC-entry password so day-to-day QC entry doesn't need to carry
+    the same weight as "who's allowed to change the reference values every
+    other page's verdicts depend on".
+
+    If `qc_admin_password` isn't configured in secrets, this gate is
+    skipped (so local/dev use isn't blocked) — same graceful-degradation
+    approach as the general login password.
+    """
+    if st.session_state.get("qc_admin_authed"):
+        return True
+
+    configured = None
+    try:
+        configured = st.secrets.get("qc_admin_password")
+    except Exception:
+        pass
+
+    if not configured:
+        return True  # no admin password configured -> don't block
+
+    st.warning("🔒 This page changes reference values that every QC verdict depends on. "
+               "Supervisor/admin password required.")
+    with st.form("admin_gate_form"):
+        pwd = st.text_input("Admin password", type="password")
+        ok = st.form_submit_button("Unlock")
+    if ok:
+        if pwd == configured:
+            st.session_state["qc_admin_authed"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect admin password.")
+    return False
+
+
 def current_operator() -> str:
     return st.session_state.get("qc_operator", "Unknown")
 
@@ -78,6 +115,6 @@ def current_branch() -> str:
 
 def logout_button():
     if st.sidebar.button("🚪 Logout / خروج"):
-        for k in ("qc_authed", "qc_operator", "qc_branch"):
+        for k in ("qc_authed", "qc_operator", "qc_branch", "qc_admin_authed"):
             st.session_state.pop(k, None)
         st.rerun()
